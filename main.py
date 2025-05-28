@@ -10,6 +10,19 @@ import torch.nn as nn
 import torch.optim as optim
 from torchvision import models
 from tqdm import tqdm
+import json
+
+def save_results_to_file(results, filename="training_results.json"):
+    """将结果保存到 JSON 文件"""
+    with open(filename, 'w') as f:
+        json.dump(results, f, indent=4)
+
+def load_results_from_file(filename="training_results.json"):
+    """从文件加载历史结果"""
+    if os.path.exists(filename):
+        with open(filename, 'r') as f:
+            return json.load(f)
+    return []
 
 def train_model(model, dataloaders, criterion, optimizer, scheduler, device, num_epochs=25):
     since = time.time()
@@ -142,8 +155,10 @@ def plot_training_history(history, title):
     plt.legend()
     
     plt.tight_layout()
-    plt.savefig(f'{title.replace(" ", "_")}_training_history.png')
-    plt.show()
+    save_path = f'{title.replace(" ", "_")}_training_history.png'
+    plt.savefig(save_path)
+    plt.close()
+    print(f"训练曲线已保存到: {save_path}")
 
 def set_parameter_requires_grad(model, feature_extracting):
     if feature_extracting:
@@ -155,12 +170,14 @@ def initialize_model(model_name, num_classes, feature_extract=True, use_pretrain
     model_ft = None
     
     if model_name == "resnet18":
-        model_ft = models.resnet18(pretrained=use_pretrained)
+        weights = models.ResNet18_Weights.DEFAULT if use_pretrained else None
+        model_ft = models.resnet18(weights=weights)
         set_parameter_requires_grad(model_ft, feature_extract)
         num_ftrs = model_ft.fc.in_features
         model_ft.fc = nn.Linear(num_ftrs, num_classes)
     elif model_name == "alexnet":
-        model_ft = models.alexnet(pretrained=use_pretrained)
+        weights = models.AlexNet_Weights.DEFAULT if use_pretrained else None
+        model_ft = models.alexnet(weights=weights)
         set_parameter_requires_grad(model_ft, feature_extract)
         num_ftrs = model_ft.classifier[6].in_features
         model_ft.classifier[6] = nn.Linear(num_ftrs, num_classes)
@@ -197,10 +214,10 @@ def main():
     )
     
     # Create data loaders
-    batch_size = 32
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4)
+    batch_size = 64
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     
     dataloaders = {
         'train': train_loader,
@@ -214,14 +231,34 @@ def main():
     # Hyperparameters to test
     models_to_test = ["resnet18", "alexnet"]
     learning_rates = [0.001, 0.0001]
-    num_epochs_list = [15, 25]
+    num_epochs_list = [15,25]
     
-    results = []
-    
+    # 初始化结果文件和缓存
+    results_file = "training_results.json"
+    if os.path.exists(results_file):
+        # 如果文件已存在，加载历史结果
+        results = load_results_from_file(results_file)
+    else:
+        results = []
+        
     # 1. Using pretrained models with feature extraction (only training the last layer)
+    existing_results = load_results_from_file(results_file)
     for model_name in models_to_test:
         for lr in learning_rates:
             for num_epochs in num_epochs_list:
+                # === 检查是否已训练过 ===
+                already_trained = any(
+                    r['model'] == model_name 
+                    and r['mode'] == 'pretrained_feature_extraction'
+                    and r['lr'] == lr 
+                    and r['epochs'] == num_epochs
+                    for r in existing_results
+                )
+                if already_trained:
+                    print(f"Skipping {model_name} (lr={lr}, epochs={num_epochs}): already trained")
+                    continue
+                # === 检查结束 ===
+                
                 print(f"\n{'='*80}")
                 print(f"Training {model_name} with pretrained weights, feature extraction, lr={lr}, epochs={num_epochs}")
                 print(f"{'='*80}")
@@ -238,6 +275,10 @@ def main():
                 # Train model
                 model_ft, history = train_model(model_ft, dataloaders, criterion, optimizer_ft, 
                                                scheduler=None, device=device, num_epochs=num_epochs)
+                # Save model
+                save_name = f"{model_name}_pretrained_feature_lr{lr}_epochs{num_epochs}.pth"
+                torch.save(model_ft.state_dict(), save_name)
+                print(f"模型权重已保存到: {save_name}")
                 
                 # Evaluate on test set
                 test_loss, test_acc = evaluate_model(model_ft, test_loader, criterion, device)
@@ -253,13 +294,28 @@ def main():
                     'lr': lr,
                     'epochs': num_epochs,
                     'test_acc': test_acc,
-                    'test_loss': test_loss
+                    'test_loss': test_loss,
+                    'train_history': history
                 })
+                save_results_to_file(results, results_file)
     
     # 2. Fine-tuning pretrained models (training all layers with different learning rates)
     for model_name in models_to_test:
         for lr in learning_rates:
             for num_epochs in num_epochs_list:
+                # === 检查是否已训练过 ===
+                already_trained = any(
+                    r['model'] == model_name 
+                    and r['mode'] == 'pretrained_fine_tuning'
+                    and r['lr'] == lr 
+                    and r['epochs'] == num_epochs
+                    for r in existing_results
+                )
+                if already_trained:
+                    print(f"Skipping {model_name} (lr={lr}, epochs={num_epochs}): already trained")
+                    continue
+                # === 检查结束 ===
+                
                 print(f"\n{'='*80}")
                 print(f"Training {model_name} with pretrained weights, fine-tuning, lr={lr}, epochs={num_epochs}")
                 print(f"{'='*80}")
@@ -291,6 +347,11 @@ def main():
                 model_ft, history = train_model(model_ft, dataloaders, criterion, optimizer_ft, 
                                                scheduler=None, device=device, num_epochs=num_epochs)
                 
+                # Save model
+                save_name = f"{model_name}_pretrained_finetune_lr{lr}_epochs{num_epochs}.pth"
+                torch.save(model_ft.state_dict(), save_name)
+                print(f"模型权重已保存到: {save_name}")
+
                 # Evaluate on test set
                 test_loss, test_acc = evaluate_model(model_ft, test_loader, criterion, device)
                 
@@ -305,11 +366,24 @@ def main():
                     'lr': lr,
                     'epochs': num_epochs,
                     'test_acc': test_acc,
-                    'test_loss': test_loss
+                    'test_loss': test_loss,
+                    'train_history': history
                 })
+                save_results_to_file(results, results_file)
     
     # 3. Training from scratch for comparison
     for model_name in models_to_test:
+        # === 检查是否已训练过 ===
+        already_trained = any(
+            r['model'] == model_name 
+            and r['mode'] == 'from_scratch'
+            for r in existing_results
+        )
+        if already_trained:
+            print(f"Skipping {model_name} from scratch: already trained")
+            continue
+        # === 检查结束 ===
+        
         print(f"\n{'='*80}")
         print(f"Training {model_name} from scratch, lr=0.001, epochs=25")
         print(f"{'='*80}")
@@ -325,12 +399,17 @@ def main():
         # Train model
         model_scratch, history = train_model(model_scratch, dataloaders, criterion, optimizer_scratch, 
                                            scheduler=None, device=device, num_epochs=25)
-        
+
+        # Save model
+        save_name = f"{model_name}_from_scratch.pth"
+        torch.save(model_scratch.state_dict(), save_name)
+        print(f"模型权重已保存到: {save_name}")
+
         # Evaluate on test set
         test_loss, test_acc = evaluate_model(model_scratch, test_loader, criterion, device)
         
         # Plot results
-        plot_title = f"{model_name} Trained From Scratch"
+        plot_title = f"{model_name} Trained From Scratch" 
         plot_training_history(history, plot_title)
         
         # Save results
@@ -340,17 +419,27 @@ def main():
             'lr': 0.001,
             'epochs': 25,
             'test_acc': test_acc,
-            'test_loss': test_loss
+            'test_loss': test_loss,
+            'train_history': history
         })
+        save_results_to_file(results, results_file)
     
     # Print comparison of results
     print("\n\nResults Summary:")
-    print("="*100)
+    print("=" * 100)
     print(f"{'Model':<12} {'Mode':<30} {'Learning Rate':<15} {'Epochs':<8} {'Test Accuracy':<15} {'Test Loss':<10}")
-    print("="*100)
-    
-    for result in results:
-        print(f"{result['model']:<12} {result['mode']:<30} {result['lr']:<15} {result['epochs']:<8} {result['test_acc']:<15.4f} {result['test_loss']:<10.4f}")
+    print("=" * 100)
 
+    # Load results
+    saved_results = load_results_from_file(results_file)
+    for result in saved_results:
+        print(
+            f"{result['model']:<12} "
+            f"{result['mode']:<30} "
+            f"{result['lr']:<15} "
+            f"{result['epochs']:<8} "
+            f"{result['test_acc']:<15.4f} "
+            f"{result['test_loss']:<10.4f}"
+        )
 if __name__ == "__main__":
     main()
